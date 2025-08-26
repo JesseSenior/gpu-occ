@@ -12,9 +12,10 @@ class GPUOccupier:
         self.lock_file = lock_file
         self.memory_ratio = memory_ratio
         self.gpu_tensors: List[Optional[torch.Tensor]] = []
-        self.compute_threads: List[threading.Thread] = []
+        self.compute_thread: Optional[threading.Thread] = None
         self.running = True
         self.paused = True
+        self.occupied_gpus: List[int] = []  # 成功占用内存的GPU列表
 
         # 检查CUDA是否可用
         if not torch.cuda.is_available():
@@ -36,8 +37,8 @@ class GPUOccupier:
         self.stop()
         sys.exit(0)
 
-    def _allocate_gpu_memory(self, gpu_id: int):
-        """在指定GPU上分配内存"""
+    def _allocate_gpu_memory(self, gpu_id: int) -> bool:
+        """在指定GPU上分配内存，返回是否成功"""
         try:
             with torch.cuda.device(gpu_id):
                 # 获取GPU总内存
@@ -59,29 +60,52 @@ class GPUOccupier:
                     f"GPU {gpu_id}: 已占用 {used_memory_gb:.2f}GB / {total_memory_gb:.2f}GB "
                     f"({used_memory / total_memory * 100:.1f}%)"
                 )
+                return True
 
         except Exception as e:
             print(f"GPU {gpu_id} 内存分配失败: {e}")
+            return False
 
-    def _compute_workload(self, gpu_id: int):
-        """在指定GPU上执行计算任务"""
+    def _compute_workload_all_gpus(self):
+        """在所有占用内存的GPU上执行计算任务"""
         try:
-            # 创建用于计算的张量
-            size = 1024
-            a = torch.randn(size, size, device=f"cuda:{gpu_id}")
-            b = torch.randn(size, size, device=f"cuda:{gpu_id}")
+            # 为每个可用GPU创建计算张量
+            compute_tensors = {}
+            for gpu_id in self.occupied_gpus:
+                try:
+                    size = 1024
+                    a = torch.randn(size, size, device=f"cuda:{gpu_id}")
+                    b = torch.randn(size, size, device=f"cuda:{gpu_id}")
+                    compute_tensors[gpu_id] = (a, b)
+                except Exception as e:
+                    print(f"GPU {gpu_id} 计算张量创建失败: {e}")
 
             while self.running and not self.paused:
-                # 执行矩阵乘法来占用GPU计算资源
-                c = torch.mm(a, b)
-                # 添加一些其他操作
-                c = torch.relu(c)
-                c = torch.sigmoid(c)
-                # 更新输入张量以避免优化
-                a = (c + 0.01 * torch.randn_like(c)).clamp(max=10)
+                # 轮询所有可用GPU执行计算
+                for gpu_id in list(compute_tensors.keys()):
+                    try:
+                        a, b = compute_tensors[gpu_id]
+                        
+                        # 执行矩阵乘法来占用GPU计算资源
+                        with torch.cuda.device(gpu_id):
+                            c = torch.mm(a, b)
+                            # 添加一些其他操作
+                            c = torch.relu(c)
+                            c = torch.sigmoid(c)
+                            # 更新输入张量以避免优化
+                            a = (c + 0.01 * torch.randn_like(c)).clamp(max=10)
+                            compute_tensors[gpu_id] = (a, b)
+                            
+                    except Exception as e:
+                        print(f"GPU {gpu_id} 计算任务出错: {e}")
+                        # 从计算列表中移除出错的GPU
+                        compute_tensors.pop(gpu_id, None)
+
+                # 短暂睡眠，避免占用过多CPU
+                time.sleep(0.001)
 
         except Exception as e:
-            print(f"GPU {gpu_id} 计算任务出错: {e}")
+            print(f"计算线程出错: {e}")
 
     def _release_gpu_memory(self):
         """释放所有GPU内存"""
@@ -94,38 +118,46 @@ class GPUOccupier:
                         torch.cuda.empty_cache()
             except Exception:
                 pass
+        self.occupied_gpus.clear()
         print("已释放所有GPU内存")
 
-    def _stop_compute_threads(self):
-        """停止所有计算线程"""
-        for thread in self.compute_threads:
-            if thread.is_alive():
-                thread.join(timeout=1.0)
-        self.compute_threads.clear()
+    def _stop_compute_thread(self):
+        """停止计算线程"""
+        if self.compute_thread and self.compute_thread.is_alive():
+            self.compute_thread.join(timeout=2.0)
+        self.compute_thread = None
 
     def _start_gpu_occupation(self):
         """开始占用GPU"""
         if self.paused:
             print("开始占用GPU资源...")
 
-            # 分配GPU内存
+            # 分配GPU内存并记录成功的GPU
+            self.occupied_gpus.clear()
             for gpu_id in range(self.num_gpus):
-                self._allocate_gpu_memory(gpu_id)
+                if self._allocate_gpu_memory(gpu_id):
+                    self.occupied_gpus.append(gpu_id)
 
-            # 启动计算线程
-            for gpu_id in range(self.num_gpus):
-                thread = threading.Thread(target=self._compute_workload, args=(gpu_id,), daemon=True)
-                thread.start()
-                self.compute_threads.append(thread)
-
-            self.paused = False
+            if self.occupied_gpus:
+                print(f"成功占用 {len(self.occupied_gpus)} 个GPU: {self.occupied_gpus}")
+                
+                # 启动单个计算线程处理所有GPU
+                self.compute_thread = threading.Thread(
+                    target=self._compute_workload_all_gpus, 
+                    daemon=True
+                )
+                self.compute_thread.start()
+                
+                self.paused = False
+            else:
+                print("没有成功占用任何GPU")
 
     def _stop_gpu_occupation(self):
         """停止占用GPU"""
         if not self.paused:
             print("暂停GPU占用...")
             self.paused = True
-            self._stop_compute_threads()
+            self._stop_compute_thread()
             self._release_gpu_memory()
 
     def run(self):
@@ -155,7 +187,7 @@ class GPUOccupier:
         """停止程序"""
         self.running = False
         self.paused = True
-        self._stop_compute_threads()
+        self._stop_compute_thread()
         self._release_gpu_memory()
         print("程序已停止")
 
