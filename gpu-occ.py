@@ -103,7 +103,7 @@ class GPUOccupier:
             compute_tensors = {}
             for gpu_id in self.occupied_gpus:
                 try:
-                    size = 32 * 1024  # 可以根据需要调整
+                    size = 4 * 1024  # 可以根据需要调整
                     # 使用二维张量进行矩阵乘法
                     a = torch.randn(size, size, device=f"cuda:{gpu_id}")
                     b = torch.randn(size, size, device=f"cuda:{gpu_id}")
