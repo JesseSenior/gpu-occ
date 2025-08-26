@@ -15,22 +15,49 @@ class GPUOccupier:
         self.compute_thread: Optional[threading.Thread] = None
         self.running = True
         self.paused = True
-        self.occupied_gpus: List[int] = []  # 成功占用内存的GPU列表
+        self.occupied_gpus: List[int] = []
+        self.available_gpus: List[int] = []  # 实际可用的GPU列表
 
         # 检查CUDA是否可用
         if not torch.cuda.is_available():
             print("CUDA不可用，退出程序")
             sys.exit(1)
 
-        self.num_gpus = torch.cuda.device_count()
-        print(f"检测到 {self.num_gpus} 个GPU")
-
-        # 初始化GPU tensors列表
-        self.gpu_tensors = [None] * self.num_gpus
+        # 获取并验证可用的GPU
+        self._discover_available_gpus()
 
         # 注册信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _discover_available_gpus(self):
+        """发现并验证实际可用的GPU"""
+        self.num_gpus = torch.cuda.device_count()
+        print(f"torch.cuda.device_count() 返回: {self.num_gpus}")
+
+        # 验证每个GPU是否真正可用
+        self.available_gpus = []
+        for gpu_id in range(self.num_gpus):
+            try:
+                # 尝试创建一个小的测试张量来验证GPU可用性
+                with torch.cuda.device(gpu_id):
+                    test_tensor = torch.tensor([1.0], device=f"cuda:{gpu_id}")
+                    del test_tensor
+                    torch.cuda.empty_cache()
+                    self.available_gpus.append(gpu_id)
+                    print(f"GPU {gpu_id}: 可用")
+            except Exception as e:
+                print(f"GPU {gpu_id}: 不可用 - {e}")
+
+        if not self.available_gpus:
+            print("没有找到可用的GPU，退出程序")
+            sys.exit(1)
+
+        print(f"发现 {len(self.available_gpus)} 个可用GPU: {self.available_gpus}")
+
+        # 根据实际可用GPU数量初始化tensor列表
+        # 使用字典而不是列表，避免索引问题
+        self.gpu_tensors = {}
 
     def _signal_handler(self, signum, frame):
         print(f"\n接收到信号 {signum}，正在清理资源...")
@@ -39,6 +66,10 @@ class GPUOccupier:
 
     def _allocate_gpu_memory(self, gpu_id: int) -> bool:
         """在指定GPU上分配内存，返回是否成功"""
+        if gpu_id not in self.available_gpus:
+            print(f"GPU {gpu_id} 不在可用GPU列表中")
+            return False
+
         try:
             with torch.cuda.device(gpu_id):
                 # 获取GPU总内存
@@ -69,39 +100,36 @@ class GPUOccupier:
     def _compute_workload_all_gpus(self):
         """在所有占用内存的GPU上执行计算任务"""
         try:
-            # 为每个可用GPU创建计算张量
             compute_tensors = {}
             for gpu_id in self.occupied_gpus:
                 try:
-                    size = 1024
+                    size = 32 * 1024  # 可以根据需要调整
+                    # 使用二维张量进行矩阵乘法
                     a = torch.randn(size, size, device=f"cuda:{gpu_id}")
                     b = torch.randn(size, size, device=f"cuda:{gpu_id}")
-                    compute_tensors[gpu_id] = (a, b)
+                    compute_tensors[gpu_id] = [a, b]  # 使用列表便于原地修改
                 except Exception as e:
                     print(f"GPU {gpu_id} 计算张量创建失败: {e}")
 
             while self.running and not self.paused:
-                # 轮询所有可用GPU执行计算
                 for gpu_id in list(compute_tensors.keys()):
                     try:
                         a, b = compute_tensors[gpu_id]
-                        
-                        # 执行矩阵乘法来占用GPU计算资源
+
                         with torch.cuda.device(gpu_id):
+                            # 矩阵乘法
                             c = torch.mm(a, b)
-                            # 添加一些其他操作
                             c = torch.relu(c)
                             c = torch.sigmoid(c)
-                            # 更新输入张量以避免优化
-                            a = (c + 0.01 * torch.randn_like(c)).clamp(max=10)
-                            compute_tensors[gpu_id] = (a, b)
-                            
+
+                            # 原地更新以减少内存分配
+                            noise = torch.randn_like(c) * 0.01
+                            a.copy_((c + noise).clamp(max=10))
+
                     except Exception as e:
                         print(f"GPU {gpu_id} 计算任务出错: {e}")
-                        # 从计算列表中移除出错的GPU
                         compute_tensors.pop(gpu_id, None)
 
-                # 短暂睡眠，避免占用过多CPU
                 time.sleep(0.001)
 
         except Exception as e:
@@ -109,15 +137,16 @@ class GPUOccupier:
 
     def _release_gpu_memory(self):
         """释放所有GPU内存"""
-        for gpu_id in range(self.num_gpus):
+        for gpu_id in list(self.gpu_tensors.keys()):
             try:
                 if self.gpu_tensors[gpu_id] is not None:
                     del self.gpu_tensors[gpu_id]
-                    self.gpu_tensors[gpu_id] = None
                     with torch.cuda.device(gpu_id):
                         torch.cuda.empty_cache()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"释放GPU {gpu_id} 内存时出错: {e}")
+
+        self.gpu_tensors.clear()
         self.occupied_gpus.clear()
         print("已释放所有GPU内存")
 
@@ -134,20 +163,17 @@ class GPUOccupier:
 
             # 分配GPU内存并记录成功的GPU
             self.occupied_gpus.clear()
-            for gpu_id in range(self.num_gpus):
+            for gpu_id in self.available_gpus:  # 只尝试可用的GPU
                 if self._allocate_gpu_memory(gpu_id):
                     self.occupied_gpus.append(gpu_id)
 
             if self.occupied_gpus:
                 print(f"成功占用 {len(self.occupied_gpus)} 个GPU: {self.occupied_gpus}")
-                
+
                 # 启动单个计算线程处理所有GPU
-                self.compute_thread = threading.Thread(
-                    target=self._compute_workload_all_gpus, 
-                    daemon=True
-                )
+                self.compute_thread = threading.Thread(target=self._compute_workload_all_gpus, daemon=True)
                 self.compute_thread.start()
-                
+
                 self.paused = False
             else:
                 print("没有成功占用任何GPU")
